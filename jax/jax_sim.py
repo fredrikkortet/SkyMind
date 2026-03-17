@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import jax
 import jax.numpy as jnp
+import jax.random
 from functools import partial
 
 
@@ -83,17 +84,29 @@ def simulate(initial_state: jnp.ndarray, t0: float, dt: float, n_steps: int):
     return trajectory
 
 
+# Batched version: map simulate over N initial states -> (N, n_steps+1, 6)
+simulate_batch = jax.vmap(simulate, in_axes=(0, None, None, None))
+
+
 # -- 4. ACMI Export ------------------------------------------------------------
 
-def export_acmi(trajectory, dt, t0, filename):
+def export_acmi(trajectories, dt, t0, filename):
     """
-    Export trajectory to an ACMI 2.1 text file for TacView.
+    Export one or more trajectories to an ACMI 2.1 text file for TacView.
+
+    Args:
+        trajectories: (N, n_steps+1, 6) array — N vehicles
+        dt:           timestep
+        t0:           initial time
+        filename:     output path
 
     Converts Cartesian (x=east, y=north, z=up) to lon/lat/alt using a
     simple equator approximation (1 deg ~ 111 320 m).
     """
     ref_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     metres_per_deg = 111_320
+    n_vehicles = trajectories.shape[0]
+    n_frames = trajectories.shape[1]
 
     with open(filename, "w") as f:
         # Header
@@ -105,21 +118,23 @@ def export_acmi(trajectory, dt, t0, filename):
         f.write("0,ReferenceLongitude=0\n")
         f.write("0,ReferenceLatitude=0\n")
 
-        n_frames = trajectory.shape[0]
         for i in range(n_frames):
             t = float(t0 + i * dt)
-            x, y, z = float(trajectory[i, 0]), float(trajectory[i, 1]), float(trajectory[i, 2])
-            lon = x / metres_per_deg
-            lat = y / metres_per_deg
-            alt = z
-
             f.write(f"#{t:.2f}\n")
-            if i == 0:
-                f.write(f"1,T={lon}|{lat}|{alt},Name=Vehicle,Type=Air+FixedWing\n")
-            else:
-                f.write(f"1,T={lon}|{lat}|{alt}\n")
+            for v in range(n_vehicles):
+                obj_id = v + 1
+                x = float(trajectories[v, i, 0])
+                y = float(trajectories[v, i, 1])
+                z = float(trajectories[v, i, 2])
+                lon = x / metres_per_deg
+                lat = y / metres_per_deg
+                alt = z
+                if i == 0:
+                    f.write(f"{obj_id},T={lon}|{lat}|{alt},Name=Vehicle_{obj_id},Type=Air+FixedWing\n")
+                else:
+                    f.write(f"{obj_id},T={lon}|{lat}|{alt}\n")
 
-    print(f"  ACMI exported to: {filename}")
+    print(f"  ACMI exported to: {filename}  ({n_vehicles} vehicles, {n_frames} frames)")
 
 
 # -- 5. Main ------------------------------------------------------------------
@@ -127,7 +142,11 @@ def export_acmi(trajectory, dt, t0, filename):
 def main():
     parser = argparse.ArgumentParser(description="JAX flight dynamics simulation")
     parser.add_argument("-o", "--output", help="Export trajectory to ACMI file for TacView")
+    parser.add_argument("-n", "--num-sims", type=int, default=1,
+                        help="Number of parallel simulations (default: 1)")
     args = parser.parse_args()
+
+    n_sims = args.num_sims
 
     # Initial conditions
     position_0    = jnp.array([0.0, 0.0, 1000.0])   # metres
@@ -150,38 +169,56 @@ def main():
     print(f"  Initial position : {position_0}")
     print(f"  Initial velocity : {velocity_0}")
     print(f"  dt = {dt} s  |  steps = {n_steps}  |  T = {dt*n_steps} s")
+    print(f"  Vehicles         : {n_sims}")
     print("-" * 55)
 
-    trajectory = simulate(initial_state, t0, dt, n_steps)
+    if n_sims == 1:
+        trajectory = simulate(initial_state, t0, dt, n_steps)
 
-    # Print every 10th step
-    print(f"{'Step':>6}  {'Time':>6}  {'x':>10}  {'y':>10}  {'z':>10}  "
-          f"{'vx':>8}  {'vy':>8}  {'vz':>8}")
-    print("-" * 75)
-    for i in range(0, n_steps + 1, 10):
-        s = trajectory[i]
-        t = t0 + i * dt
-        print(f"{i:6d}  {t:6.1f}  "
-              f"{s[0]:10.3f}  {s[1]:10.3f}  {s[2]:10.3f}  "
-              f"{s[3]:8.3f}  {s[4]:8.3f}  {s[5]:8.3f}")
+        # Print every 10th step
+        print(f"{'Step':>6}  {'Time':>6}  {'x':>10}  {'y':>10}  {'z':>10}  "
+              f"{'vx':>8}  {'vy':>8}  {'vz':>8}")
+        print("-" * 75)
+        for i in range(0, n_steps + 1, 10):
+            s = trajectory[i]
+            t = t0 + i * dt
+            print(f"{i:6d}  {t:6.1f}  "
+                  f"{s[0]:10.3f}  {s[1]:10.3f}  {s[2]:10.3f}  "
+                  f"{s[3]:8.3f}  {s[4]:8.3f}  {s[5]:8.3f}")
 
-    # Sanity check: analytic solution for free flight
-    T             = n_steps * dt
-    expected_pos  = position_0 + velocity_0 * T
-    simulated_pos = trajectory[-1, :3]
-    error         = jnp.linalg.norm(simulated_pos - expected_pos)
+        # Sanity check: analytic solution for free flight
+        T             = n_steps * dt
+        expected_pos  = position_0 + velocity_0 * T
+        simulated_pos = trajectory[-1, :3]
+        error         = jnp.linalg.norm(simulated_pos - expected_pos)
 
-    print("-" * 75)
-    print(f"\n  Analytic final position : {expected_pos}")
-    print(f"  Simulated final position: {simulated_pos}")
-    print(f"  L2 error                : {error:.2e}")
-    print("\n  Trajectory shape:", trajectory.shape)
-    print("=" * 55)
+        print("-" * 75)
+        print(f"\n  Analytic final position : {expected_pos}")
+        print(f"  Simulated final position: {simulated_pos}")
+        print(f"  L2 error                : {error:.2e}")
+        print("\n  Trajectory shape:", trajectory.shape)
+        print("=" * 55)
+
+        # For ACMI export, wrap as (1, n_steps+1, 6)
+        trajectories = trajectory[None, :, :]
+    else:
+        # Generate randomized initial states: add ±50 m offsets to position
+        key = jax.random.PRNGKey(42)
+        pos_key, _ = jax.random.split(key)
+        pos_offsets = jax.random.normal(pos_key, shape=(n_sims, 3)) * 50.0
+        positions = position_0 + pos_offsets                      # (N, 3)
+        velocities = jnp.tile(velocity_0, (n_sims, 1))           # (N, 3)
+        initial_states = jnp.concatenate([positions, velocities], axis=1)  # (N, 6)
+
+        trajectories = simulate_batch(initial_states, t0, dt, n_steps)  # (N, n_steps+1, 6)
+
+        print(f"\n  Simulated {n_sims} vehicles  |  trajectories shape: {trajectories.shape}")
+        print("=" * 55)
 
     if args.output:
-        export_acmi(trajectory, dt, t0, args.output)
+        export_acmi(trajectories, dt, t0, args.output)
 
-    return trajectory
+    return trajectories
 
 
 if __name__ == "__main__":
