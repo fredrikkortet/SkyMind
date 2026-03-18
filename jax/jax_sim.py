@@ -202,12 +202,13 @@ def main():
         # For ACMI export, wrap as (1, n_steps+1, 6)
         trajectories = trajectory[None, :, :]
     else:
-        # Generate randomized initial states: add ±50 m offsets to position
+        # Generate randomized initial states: add ±50 m position and ±10 m/s velocity offsets
         key = jax.random.PRNGKey(42)
-        pos_key, _ = jax.random.split(key)
+        pos_key, vel_key = jax.random.split(key)
         pos_offsets = jax.random.normal(pos_key, shape=(n_sims, 3)) * 50.0
+        vel_offsets = jax.random.normal(vel_key, shape=(n_sims, 3)) * 10.0
         positions = position_0 + pos_offsets                      # (N, 3)
-        velocities = jnp.tile(velocity_0, (n_sims, 1))           # (N, 3)
+        velocities = velocity_0 + vel_offsets                     # (N, 3)
         initial_states = jnp.concatenate([positions, velocities], axis=1)  # (N, 6)
 
         trajectories = simulate_batch(initial_states, t0, dt, n_steps)  # (N, n_steps+1, 6)
