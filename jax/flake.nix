@@ -49,7 +49,13 @@
         nix build .#dockerImage
         echo "Loading into Docker..."
         docker load < result
-        echo "Done! Run with: docker run -it jax-sim:latest"
+        echo "Done! Run with: run-docker"
+      '';
+      run-docker = pkgs.writeShellScriptBin "run-docker" ''
+        set -e
+        echo "Running Docker image..."
+        docker run -it jax-sim:latest
+        echo "Done running Docker image!"
       '';
     in
     {
@@ -59,6 +65,7 @@
         packages = [
           python
           build-docker
+          run-docker
           pkgs.docker
         ];
         shellHook = ''
