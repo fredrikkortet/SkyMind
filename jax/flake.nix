@@ -64,7 +64,7 @@
         shellHook = ''
           if ! docker info &>/dev/null 2>&1; then
             echo "Starting Docker daemon..."
-            sudo sh -c "dockerd -G '$(id -gn)' > /dev/null 2>&1 < /dev/null &"
+            sudo sh -c "$(which dockerd) -G '$(id -gn)' > /dev/null 2>&1 < /dev/null &"
             while ! docker info &>/dev/null 2>&1; do
               sleep 1
             done
