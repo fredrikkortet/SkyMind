@@ -15,8 +15,8 @@
         ps.jaxlib
       ]);
       appSrc = pkgs.runCommand "app-src" { } ''
-        mkdir -p $out/app
-        cp ${./jax_sim.py} $out/app/jax_sim.py
+        mkdir -p $out
+        cp -r ${./src} $out/app
       '';
       dockerImage = pkgs.dockerTools.buildImage {
         name = "jax-sim";
@@ -38,7 +38,7 @@
         config = {
           Cmd = [
             "${python}/bin/python"
-            "/app/jax_sim.py"
+            "jax_sim.py"
           ];
           WorkingDir = "/app";
         };
