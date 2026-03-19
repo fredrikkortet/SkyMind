@@ -75,6 +75,9 @@
               sleep 1
             done
             echo "Docker daemon started."
+            echo "Commands available:"
+            echo " build-docker Build docker image"
+            echo " run-docker Run docker image"
           fi
         '';
       };
