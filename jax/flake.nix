@@ -5,7 +5,8 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -13,10 +14,63 @@
         ps.jax
         ps.jaxlib
       ]);
+      appSrc = pkgs.runCommand "app-src" { } ''
+        mkdir -p $out/app
+        cp ${./jax_sim.py} $out/app/jax_sim.py
+      '';
+      dockerImage = pkgs.dockerTools.buildImage {
+        name = "jax-sim";
+        tag = "latest";
+        copyToRoot = pkgs.buildEnv {
+          name = "image-root";
+          paths = [
+            python
+            pkgs.bashInteractive
+            pkgs.coreutils
+            appSrc
+          ];
+          pathsToLink = [
+            "/bin"
+            "/lib"
+            "/app"
+          ];
+        };
+        config = {
+          Cmd = [
+            "${python}/bin/python"
+            "/app/jax_sim.py"
+          ];
+          WorkingDir = "/app";
+        };
+      };
+      build-docker = pkgs.writeShellScriptBin "build-docker" ''
+        set -e
+        echo "Building Docker image..."
+        nix build .#dockerImage
+        echo "Loading into Docker..."
+        docker load < result
+        echo "Done! Run with: docker run -it jax-sim:latest"
+      '';
     in
     {
+      packages.${system}.dockerImage = dockerImage;
+
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ python ];
+        packages = [
+          python
+          build-docker
+          pkgs.docker
+        ];
+        shellHook = ''
+          if ! docker info &>/dev/null 2>&1; then
+            echo "Starting Docker daemon..."
+            sudo sh -c "dockerd -G '$(id -gn)' > /dev/null 2>&1 < /dev/null &"
+            while ! docker info &>/dev/null 2>&1; do
+              sleep 1
+            done
+            echo "Docker daemon started."
+          fi
+        '';
       };
     };
 }
