@@ -1,5 +1,5 @@
 {
-  description = "JAX flight dynamics simulation";
+  description = "pytorch flight dynamics simulation";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,15 +11,14 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       python = pkgs.python3.withPackages (ps: [
-        ps.jax
-        ps.jaxlib
+        ps.torch
       ]);
       appSrc = pkgs.runCommand "app-src" { } ''
         mkdir -p $out
         cp -r ${./src} $out/app
       '';
       dockerImage = pkgs.dockerTools.buildImage {
-        name = "jax-sim";
+        name = "pytorch-sim";
         tag = "latest";
         copyToRoot = pkgs.buildEnv {
           name = "image-root";
@@ -38,7 +37,7 @@
         config = {
           Cmd = [
             "${python}/bin/python"
-            "jax_sim.py"
+            "pytorch_sim.py"
           ];
           WorkingDir = "/app";
         };
@@ -54,7 +53,7 @@
       run-docker = pkgs.writeShellScriptBin "run-docker" ''
         set -e
         echo "Running Docker image..."
-        docker run -it jax-sim:latest
+        docker run -it pytorch-sim:latest
         echo "Done running Docker image!"
       '';
     in
