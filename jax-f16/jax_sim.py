@@ -6,6 +6,7 @@ with aerodynamic lookup tables and quaternion-based attitude representation.
 """
 
 import argparse
+import dataclasses
 from datetime import datetime, timezone
 from functools import partial
 
@@ -16,22 +17,123 @@ import jax.random
 from fighterplane import FighterPlaneState, FighterPlaneControlState, update
 
 
+# -- 0. PID Controller --------------------------------------------------------
+
+
+@dataclasses.dataclass
+class PIDState:
+    """Carries integral error terms for the PID controller through scan."""
+
+    alt_integral: jax.typing.ArrayLike = 0.0
+    spd_integral: jax.typing.ArrayLike = 0.0
+
+
+# Register PIDState as a JAX pytree
+_pid_fields = dataclasses.fields(PIDState)
+jax.tree_util.register_pytree_node(
+    PIDState,
+    lambda obj: (tuple(getattr(obj, f.name) for f in _pid_fields), None),
+    lambda aux, children: PIDState(
+        **{f.name: c for f, c in zip(_pid_fields, children)}
+    ),
+)
+
+# Trim feedforward constants
+_TRIM_THROTTLE = 0.164266
+_TRIM_ELEVATOR = 0.038325
+_TRIM_PITCH = -0.015158  # ≈ alpha at trim
+
+# PID gains
+_KP_ALT = 0.001364  # rad pitch correction per m altitude error
+_KI_ALT = -0.005066  # integral term
+_KD_ALT = -0.246749  # derivative (climb rate damping)
+_KP_PITCH = -0.214935  # normalized elevator per rad pitch error
+_KD_PITCH = -0.878661  # pitch rate damping (using Q)
+_KP_SPD = 0.876461  # throttle per m/s speed error
+_KI_SPD = 0.130524  # integral term
+_KP_ROLL = -2.370678  # aileron per rad roll error
+_KD_ROLL = -1.057750  # roll rate damping (using P)
+_KP_YAW = 0.822293  # rudder per rad beta
+_KD_YAW = -1.802605  # yaw rate damping (using R)
+
+
+def pid_controller(
+    state: FighterPlaneState,
+    pid_state: PIDState,
+    target_alt: float,
+    target_vt: float,
+    dt: float,
+) -> tuple[FighterPlaneControlState, PIDState]:
+    """
+    Cascaded PID controller for stable F-16 flight.
+
+    Uses trim feedforward so that at zero error the outputs match the
+    approximate trim control inputs.  The altitude outer loop produces a
+    pitch correction on top of _TRIM_PITCH (≈ alpha at trim).
+
+    Returns (action, new_pid_state).
+    """
+    # --- Altitude hold (outer loop) → pitch correction ---
+    alt_err = target_alt - state.altitude
+    climb_rate = state.vt * jnp.sin(state.pitch - state.alpha)
+    alt_integral = jnp.clip(pid_state.alt_integral + alt_err * dt, -500.0, 500.0)
+    pitch_correction = (
+        _KP_ALT * alt_err + _KI_ALT * alt_integral + _KD_ALT * (-climb_rate)
+    )
+    pitch_correction = jnp.clip(pitch_correction, jnp.radians(-10.0), jnp.radians(10.0))
+    pitch_cmd = _TRIM_PITCH + pitch_correction
+
+    # --- Pitch hold (inner loop) → elevator (with trim bias) ---
+    pitch_err = pitch_cmd - state.pitch
+    elevator = _TRIM_ELEVATOR + _KP_PITCH * pitch_err + _KD_PITCH * (-state.Q)
+    elevator = jnp.clip(elevator, -1.0, 1.0)
+
+    # --- Speed hold → throttle (with trim bias) ---
+    spd_err = target_vt - state.vt
+    spd_integral = jnp.clip(pid_state.spd_integral + spd_err * dt, -50.0, 50.0)
+    throttle = _TRIM_THROTTLE + _KP_SPD * spd_err + _KI_SPD * spd_integral
+    throttle = jnp.clip(throttle, 0.0, 1.0)
+
+    # --- Roll hold (wings level) → aileron ---
+    aileron = _KP_ROLL * (-state.roll) + _KD_ROLL * (-state.P)
+    aileron = jnp.clip(aileron, -1.0, 1.0)
+
+    # --- Yaw damper → rudder ---
+    rudder = _KP_YAW * (-state.beta) + _KD_YAW * (-state.R)
+    rudder = jnp.clip(rudder, -1.0, 1.0)
+
+    action = FighterPlaneControlState(
+        throttle=throttle,
+        elevator=elevator,
+        aileron=aileron,
+        rudder=rudder,
+        leading_edge_flap=0.0,
+    )
+    new_pid_state = PIDState(alt_integral=alt_integral, spd_integral=spd_integral)
+    return action, new_pid_state
+
+
 # -- 1. Simulation Loop (via jax.lax.scan) ------------------------------------
 
 
-@partial(jax.jit, static_argnums=(3,))
+@partial(jax.jit, static_argnums=(4,))
 def simulate(
     initial_state: FighterPlaneState,
-    action: FighterPlaneControlState,
+    target_alt: float,
+    target_vt: float,
     dt: float,
     n_steps: int,
 ):
     """
     Run the F-16 simulation for n_steps using jax.lax.scan.
 
+    Uses a PID controller to compute control inputs at each step for
+    stable altitude and speed hold.
+
     Args:
         initial_state: FighterPlaneState (scalar fields)
-        action:        FighterPlaneControlState (constant control input)
+        target_alt:    target altitude (m) for the PID controller
+        target_vt:     target airspeed (m/s) for the PID controller
         dt:            fixed timestep
         n_steps:       number of integration steps
 
@@ -39,11 +141,18 @@ def simulate(
         trajectory: FighterPlaneState with fields of shape (n_steps + 1,)
     """
 
-    def step(state, _):
+    def step(carry, _):
+        state, pid_state = carry
+        action, new_pid_state = pid_controller(
+            state, pid_state, target_alt, target_vt, dt
+        )
         next_state = update(state, action, dt)
-        return next_state, next_state
+        return (next_state, new_pid_state), next_state
 
-    _, trajectory = jax.lax.scan(step, initial_state, None, length=n_steps)
+    initial_pid_state = PIDState()
+    _, trajectory = jax.lax.scan(
+        step, (initial_state, initial_pid_state), None, length=n_steps
+    )
 
     # Prepend the initial state so trajectory[0] == initial_state
     trajectory = jax.tree.map(
@@ -55,7 +164,7 @@ def simulate(
 
 
 # Batched version: map simulate over N initial states -> N trajectories
-simulate_batch = jax.vmap(simulate, in_axes=(0, None, None, None))
+simulate_batch = jax.vmap(simulate, in_axes=(0, None, None, None, None))
 
 
 # -- 2. ACMI Export ------------------------------------------------------------
@@ -165,7 +274,7 @@ def main():
 
     # F-16 initial conditions (approximate trim at 10,000 ft / 502 ft/s)
     altitude_m = 3048.0  # ~10,000 ft
-    vt_ms = 153.0  # m/s (~502 ft/s)
+    vt_ms = 200.0  # m/s
     alpha_rad = 0.039  # ~2.2 deg angle of attack
     pitch_rad = 0.039  # match alpha for approximate level flight
 
@@ -221,15 +330,7 @@ def main():
             az=1.0,
         )
 
-        action = FighterPlaneControlState(
-            throttle=0.0375,
-            elevator=-0.02,
-            aileron=0.0,
-            rudder=0.0,
-            leading_edge_flap=0.0,
-        )
-
-        trajectory = simulate(initial_state, action, dt, n_steps)
+        trajectory = simulate(initial_state, altitude_m, vt_ms, dt, n_steps)
 
         # Print every 100th step
         print(
@@ -303,15 +404,7 @@ def main():
             az=jnp.ones(n_sims),
         )
 
-        action = FighterPlaneControlState(
-            throttle=0.0375,
-            elevator=-0.02,
-            aileron=0.0,
-            rudder=0.0,
-            leading_edge_flap=0.0,
-        )
-
-        trajectories = simulate_batch(initial_states, action, dt, n_steps)
+        trajectories = simulate_batch(initial_states, altitude_m, vt_ms, dt, n_steps)
 
         print(f"\n  Simulated {n_sims} vehicles")
         print("=" * 60)
