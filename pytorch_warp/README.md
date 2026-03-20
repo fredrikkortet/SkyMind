@@ -95,7 +95,10 @@ def apply_actions(self, actions):
 
 ```bash
 pip install torch numpy
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
+Cuda toolkit version should match what is installed from torchvision (e.g CUDA toolkit 12.9 requires pip3 install... /whl/cu129)
+
 
 ### Basic Usage
 
